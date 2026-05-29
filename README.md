@@ -1,3 +1,8 @@
+> **Part of the Personal Health Data Platform** (hub: `Healthkit-influxdb-grafana`).
+> This fetcher now writes to **VictoriaMetrics** via the InfluxDB line protocol and tags every
+> series `provider=fitbit`, so your Fitbit data can share one store and one Grafana with Apple,
+> ResMed, Google and Renpho. See the hub's `docs/ARCHITECTURE.md` for the data conventions.
+
 <p align="center">
 <img src="./extra/Fitbit_dashboard.png" width="500" height="160" align="center">
 </p>
