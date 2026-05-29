@@ -7,36 +7,45 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: fitbit-fetch-data
+    depends_on:
+      - victoriametrics
     volumes:
-      - ./logs:/app/logs # Ensure this folder exists and is owned by user id 1000
-      - ./tokens:/app/tokens # Ensure this folder exists and is owned by user id 1000
+      - ./logs:/app/logs       # Ensure this folder exists and is owned by uid 1000
+      - ./tokens:/app/tokens   # Ensure this folder exists and is owned by uid 1000
       - /etc/timezone:/etc/timezone:ro
     environment:
       - FITBIT_LOG_FILE_PATH=/app/logs/fitbit.log
       - TOKEN_FILE_PATH=/app/tokens/fitbit.token
       - OVERWRITE_LOG_FILE=True
-      # VictoriaMetrics environment variables
-      - VICTORIA_METRICS_URL=http://victoriametrics:8428/api/v1/import
+      # Shared platform backend (InfluxDB line protocol -> VictoriaMetrics)
+      - VICTORIA_METRICS_URL=http://victoriametrics:8428
+      - PROVIDER=fitbit
       # Fitbit application settings
-      - CLIENT_ID=your_application_client_ID # Change this to your client ID
-      - CLIENT_SECRET=your_application_client_secret # Change this to your client Secret
-      - DEVICENAME=Your_Device_Name # e.g. "Charge5"
-      - LOCAL_TIMEZONE=Automatic # Set to "Automatic" for automatic timezone setup from user profile.
-  
+      - CLIENT_ID=your_application_client_ID
+      - CLIENT_SECRET=your_application_client_secret
+      - DEVICENAME=Your_Device_Name        # e.g. "Charge5"
+      - LOCAL_TIMEZONE=Automatic            # "Automatic" derives it from your Fitbit profile
+
   victoriametrics:
-    image: victoriametrics/victoria-metrics:latest
+    image: victoriametrics/victoria-metrics:v1.103.0
     container_name: victoriametrics
     restart: unless-stopped
     ports:
-      - '8428:8428' # VictoriaMetrics HTTP API port
+      - '8428:8428'
     volumes:
-      - ./victoriametrics:/victoriametrics # Ensure this folder exists to persist metrics
+      - ./victoriametrics:/victoria-metrics-data
+    command:
+      - '--storageDataPath=/victoria-metrics-data'
+      - '--influxSkipSingleField'   # measurement,tags value=X -> clean metric name "measurement"
+      - '--retentionPeriod=100y'    # keep full history (imports can span years)
 
   grafana:
     restart: unless-stopped
-    volumes:
-      - './grafana:/var/lib/grafana'
-    ports:
-      - '3000:3000'
     container_name: grafana
     image: 'grafana/grafana:latest'
+    depends_on:
+      - victoriametrics
+    ports:
+      - '3000:3000'
+    volumes:
+      - './grafana:/var/lib/grafana'

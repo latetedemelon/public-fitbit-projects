@@ -1,26 +1,46 @@
+# %%
 import base64, requests, schedule, time, json, pytz, logging, os, sys
 from requests.exceptions import ConnectionError
 from datetime import datetime, timedelta
+# Data is written to VictoriaMetrics via the InfluxDB line protocol
+# (see write_points_to_victoria_metrics below); no InfluxDB client needed.
 
-# Variables
+# %% [markdown]
+# ## Variables
+
+# %%
 FITBIT_LOG_FILE_PATH = os.environ.get("FITBIT_LOG_FILE_PATH") or "your/expected/log/file/location/path"
 TOKEN_FILE_PATH = os.environ.get("TOKEN_FILE_PATH") or "your/expected/token/file/location/path"
 OVERWRITE_LOG_FILE = True
 FITBIT_LANGUAGE = 'en_US'
-VICTORIA_METRICS_URL = os.environ.get("VICTORIA_METRICS_URL") or "http://your_victoriametrics_url_here/api/v1/import"  # VictoriaMetrics endpoint
-client_id = os.environ.get("CLIENT_ID") or "your_application_client_ID"
-client_secret = os.environ.get("CLIENT_SECRET") or "your_application_client_secret"
-DEVICENAME = os.environ.get("DEVICENAME") or "Your_Device_Name"
-ACCESS_TOKEN = ""
-AUTO_DATE_RANGE = True
-auto_update_date_range = 1
-LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE") or "Automatic"
-SCHEDULE_AUTO_UPDATE = True if AUTO_DATE_RANGE else False
+# --- VictoriaMetrics (shared platform backend) ---
+# Base URL, e.g. http://victoriametrics:8428. Legacy /api/v1/import or /write
+# suffixes are tolerated and normalized back to the base.
+_VM_RAW = os.environ.get("VICTORIA_METRICS_URL") or "http://victoriametrics:8428"
+for _suffix in ("/api/v1/import/prometheus", "/api/v1/import", "/write"):
+    if _VM_RAW.rstrip("/").endswith(_suffix):
+        _VM_RAW = _VM_RAW.rstrip("/")[: -len(_suffix)]
+        break
+VICTORIA_METRICS_WRITE_URL = _VM_RAW.rstrip("/") + "/write"
+# Provider label attached to every series (store separate, display together).
+PROVIDER = os.environ.get("PROVIDER", "fitbit")
+# MAKE SURE you set the application type to PERSONAL. Otherwise, you won't have access to intraday data series, resulting in 40X errors.
+client_id = os.environ.get("CLIENT_ID") or "your_application_client_ID" # Change this to your client ID
+client_secret = os.environ.get("CLIENT_SECRET") or "your_application_client_secret" # Change this to your client Secret
+DEVICENAME = os.environ.get("DEVICENAME") or "Your_Device_Name" # e.g. "Charge5"
+ACCESS_TOKEN = "" # Empty Global variable initialization, will be replaced with a functional access code later using the refresh code
+AUTO_DATE_RANGE = True # Automatically selects date range from todays date and update_date_range variable
+auto_update_date_range = 1 # Days to go back from today for AUTO_DATE_RANGE *** DO NOT go above 2 - otherwise may break rate limit ***
+LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE") or "Automatic" # set to "Automatic" for Automatic setup from User profile (if not mentioned here specifically).
+SCHEDULE_AUTO_UPDATE = True if AUTO_DATE_RANGE else False # Scheduling updates of data when script runs
 SERVER_ERROR_MAX_RETRY = 3
 EXPIRED_TOKEN_MAX_RETRY = 5
 SKIP_REQUEST_ON_SERVER_ERROR = True
 
-# Logging setup
+# %% [markdown]
+# ## Logging setup
+
+# %%
 if OVERWRITE_LOG_FILE:
     with open(FITBIT_LOG_FILE_PATH, "w"): pass
 
@@ -33,46 +53,23 @@ logging.basicConfig(
     ]
 )
 
-# VictoriaMetrics Data Write Function
-def write_points_to_victoria_metrics(points):
-    try:
-        headers = {
-            'Content-Type': 'text/plain'
-        }
-        # Prepare data in line protocol format for VictoriaMetrics
-        lines = []
-        for point in points:
-            measurement = point['measurement']
-            time = point['time']
-            fields = ",".join([f"{k}={v}" for k, v in point['fields'].items()])
-            tags = ",".join([f"{k}={v}" for k, v in point['tags'].items()])
-            line = f"{measurement},{tags} {fields} {int(datetime.fromisoformat(time).timestamp() * 1e9)}"
-            lines.append(line)
+# %% [markdown]
+# ## Setting up base API Caller function
 
-        data = "\n".join(lines)
-        response = requests.post(VICTORIA_METRICS_URL, headers=headers, data=data)
-
-        if response.status_code == 200:
-            logging.info("Successfully updated VictoriaMetrics database with new points")
-        else:
-            logging.error(f"VictoriaMetrics connection failed with status code {response.status_code}: {response.text}")
-    except Exception as err:
-        logging.error(f"Error while writing points to VictoriaMetrics: {err}")
-        print(f"VictoriaMetrics connection failed: {err}")
-
-# API Request Function
+# %%
+# Generic Request caller for all 
 def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="get"):
     global ACCESS_TOKEN
     retry_attempts = 0
     logging.debug("Requesting data from fitbit via Url : " + url)
-    while True:
+    while True: # Unlimited Retry attempts
         if request_type == "get":
             headers = {
                 "Authorization": f"Bearer {ACCESS_TOKEN}",
                 "Accept": "application/json",
                 'Accept-Language': FITBIT_LANGUAGE
             }
-        try:
+        try:        
             if request_type == "get":
                 response = requests.get(url, headers=headers, params=params, data=data)
             elif request_type == "post":
@@ -80,35 +77,47 @@ def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="
             else:
                 raise Exception("Invalid request type " + str(request_type))
         
-            if response.status_code == 200:
+            if response.status_code == 200: # Success
                 return response.json()
-            elif response.status_code == 429:
+            elif response.status_code == 429: # API Limit reached
                 retry_after = int(response.headers["Retry-After"]) + 300
-                logging.warning("Fitbit API limit reached. Retrying in " + str(retry_after) + " seconds")
+                logging.warning("Fitbit API limit reached. Error code : " + str(response.status_code) + ", Retrying in " + str(retry_after) + " seconds")
+                print("Fitbit API limit reached. Error code : " + str(response.status_code) + ", Retrying in " + str(retry_after) + " seconds")
                 time.sleep(retry_after)
-            elif response.status_code == 401:
+            elif response.status_code == 401: # Access token expired ( most likely )
+                logging.info("Current Access Token : " + ACCESS_TOKEN)
+                logging.warning("Error code : " + str(response.status_code) + ", Details : " + response.text)
+                print("Error code : " + str(response.status_code) + ", Details : " + response.text)
                 ACCESS_TOKEN = Get_New_Access_Token(client_id, client_secret)
+                logging.info("New Access Token : " + ACCESS_TOKEN)
                 time.sleep(30)
                 if retry_attempts > EXPIRED_TOKEN_MAX_RETRY:
-                    raise Exception("Unable to solve the 401 Error. " + response.text)
-            elif response.status_code in [500, 502, 503, 504]:
-                logging.warning("Server Error encountered. Retrying after 120 seconds....")
+                    logging.error("Unable to solve the 401 Error. Please debug - " + response.text)
+                    raise Exception("Unable to solve the 401 Error. Please debug - " + response.text)
+            elif response.status_code in [500, 502, 503, 504]: # Fitbit server is down or not responding ( most likely ):
+                logging.warning("Server Error encountered ( Code 5xx ): Retrying after 120 seconds....")
                 time.sleep(120)
                 if retry_attempts > SERVER_ERROR_MAX_RETRY:
-                    logging.error("Unable to solve the server Error. Retry limit exceeded.")
+                    logging.error("Unable to solve the server Error. Retry limit exceed. Please debug - " + response.text)
                     if SKIP_REQUEST_ON_SERVER_ERROR:
+                        logging.warning("Retry limit reached for server error : Skipping request -> " + url)
                         return None
             else:
-                logging.error("Fitbit API request failed. Status code: " + str(response.status_code) + " " + str(response.text))
+                logging.error("Fitbit API request failed. Status code: " + str(response.status_code) + " " + str(response.text) )
+                print(f"Fitbit API request failed. Status code: {response.status_code}", response.text)
                 response.raise_for_status()
                 return None
 
         except ConnectionError as e:
-            logging.error("Failed to connect to the internet: " + str(e))
+            logging.error("Retrying in 5 minutes - Failed to connect to internet : " + str(e))
+            print("Retrying in 5 minutes - Failed to connect to internet : " + str(e))
         retry_attempts += 1
         time.sleep(30)
 
-# Token management functions
+# %% [markdown]
+# ## Token Refresh Management
+
+# %%
 def refresh_fitbit_tokens(client_id, client_secret, refresh_token):
     logging.info("Attempting to refresh tokens...")
     url = "https://api.fitbit.com/oauth2/token"
@@ -129,6 +138,7 @@ def refresh_fitbit_tokens(client_id, client_secret, refresh_token):
     }
     with open(TOKEN_FILE_PATH, "w") as file:
         json.dump(tokens, file)
+    logging.info("Fitbit token refresh successful!")
     return access_token, new_refresh_token
 
 def load_tokens_from_file():
@@ -146,102 +156,405 @@ def Get_New_Access_Token(client_id, client_secret):
 
 ACCESS_TOKEN = Get_New_Access_Token(client_id, client_secret)
 
-# Fitbit Data Retrieval Functions
+# %% [markdown]
+# ## Influxdb Database Initialization
+
+# %%
+# --- InfluxDB line-protocol helpers (shared platform convention) ---
+def _vm_escape_meas(value):
+    return str(value).replace("\\", "\\\\").replace(",", "\\,").replace(" ", "\\ ")
+
+def _vm_escape_tag(value):
+    return str(value).replace("\\", "\\\\").replace(",", "\\,").replace("=", "\\=").replace(" ", "\\ ")
+
+def _vm_field(value):
+    # Returns a line-protocol field token, or None to skip. VictoriaMetrics is
+    # numeric-only and DROPS THE WHOLE LINE on a string field, so strings are
+    # skipped here (string data should be carried as tags instead).
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return None
+
+def write_points_to_victoria_metrics(points):
+    """Write points (list of dicts with measurement/time(ISO)/fields/[tags]) to
+    VictoriaMetrics using the InfluxDB line protocol. Every series is tagged
+    with the provider label; values are escaped so measurement names containing
+    spaces (e.g. "Sleep Summary") remain valid."""
+    try:
+        lines = []
+        for point in points:
+            measurement = _vm_escape_meas(point["measurement"])
+            ts_ns = int(datetime.fromisoformat(point["time"]).timestamp() * 1e9)
+            tags = {"provider": PROVIDER}
+            tags.update(point.get("tags") or {})
+            tag_str = ",".join(
+                f"{_vm_escape_tag(k)}={_vm_escape_tag(v)}"
+                for k, v in tags.items() if v is not None and v != ""
+            )
+            field_pairs = []
+            for k, v in point["fields"].items():
+                token = _vm_field(v)
+                if token is not None:
+                    field_pairs.append(f"{_vm_escape_tag(k)}={token}")
+            field_str = ",".join(field_pairs)
+            if not field_str:
+                continue
+            head = f"{measurement},{tag_str}" if tag_str else measurement
+            lines.append(f"{head} {field_str} {ts_ns}")
+        if not lines:
+            return
+        data = "\n".join(lines).encode("utf-8")
+        response = requests.post(VICTORIA_METRICS_WRITE_URL, headers={"Content-Type": "text/plain"}, data=data)
+        if response.status_code in (200, 204):
+            logging.info("Successfully updated VictoriaMetrics with new points")
+        else:
+            logging.error(f"VictoriaMetrics write failed ({response.status_code}): {response.text}")
+            print("VictoriaMetrics write failed!", response.status_code, response.text)
+    except Exception as err:
+        logging.error("VictoriaMetrics write failed! " + str(err))
+        print("VictoriaMetrics write failed! ", str(err))
+
+# Backwards-compatible alias for the existing call sites / scheduler below.
+write_points_to_influxdb = write_points_to_victoria_metrics
+
+# %% [markdown]
+# ## Set Timezone from profile data
+
+# %%
+if LOCAL_TIMEZONE == "Automatic":
+    LOCAL_TIMEZONE = pytz.timezone(request_data_from_fitbit("https://api.fitbit.com/1/user/-/profile.json")["user"]["timezone"])
+else:
+    LOCAL_TIMEZONE = pytz.timezone(LOCAL_TIMEZONE)
+
+# %% [markdown]
+# ## Selecting Dates for update
+
+# %%
+if AUTO_DATE_RANGE:
+    end_date = datetime.now(LOCAL_TIMEZONE)
+    start_date = end_date - timedelta(days=auto_update_date_range)
+    end_date_str = end_date.strftime("%Y-%m-%d")
+    start_date_str = start_date.strftime("%Y-%m-%d")
+else:
+    start_date_str = input("Enter start date in YYYY-MM-DD format : ")
+    end_date_str = input("Enter end date in YYYY-MM-DD format : ")
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+
+# %% [markdown]
+# ## Setting up functions for Requesting data from server
+
+# %%
+collected_records = []
+
+def update_working_dates():
+    global end_date, start_date, end_date_str, start_date_str
+    end_date = datetime.now(LOCAL_TIMEZONE)
+    start_date = end_date - timedelta(days=auto_update_date_range)
+    end_date_str = end_date.strftime("%Y-%m-%d")
+    start_date_str = start_date.strftime("%Y-%m-%d")
+
+# Get last synced battery level of the device
 def get_battery_level():
     device = request_data_from_fitbit("https://api.fitbit.com/1/user/-/devices.json")[0]
-    if device:
+    if device != None:
         collected_records.append({
             "measurement": "DeviceBatteryLevel",
             "time": LOCAL_TIMEZONE.localize(datetime.fromisoformat(device['lastSyncTime'])).astimezone(pytz.utc).isoformat(),
-            "fields": {"value": float(device['batteryLevel'])},
-            "tags": {"Device": DEVICENAME}
+            "fields": {
+                "value": float(device['batteryLevel'])
+            }
         })
+        logging.info("Recorded battery level for " + DEVICENAME)
+    else:
+        logging.error("Recording battery level failed : " + DEVICENAME)
 
+# For intraday detailed data, max possible range in one day. 
 def get_intraday_data_limit_1d(date_str, measurement_list):
     for measurement in measurement_list:
-        data = request_data_from_fitbit(f'https://api.fitbit.com/1/user/-/activities/{measurement[0]}/date/{date_str}/1d/{measurement[2]}.json')["activities-" + measurement[0] + "-intraday"]['dataset']
-        if data:
+        data = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/' + measurement[0] + '/date/' + date_str + '/1d/' + measurement[2] + '.json')["activities-" + measurement[0] + "-intraday"]['dataset']
+        if data != None:
             for value in data:
                 log_time = datetime.fromisoformat(date_str + "T" + value['time'])
                 utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
                 collected_records.append({
-                    "measurement": measurement[1],
-                    "time": utc_time,
-                    "tags": {"Device": DEVICENAME},
-                    "fields": {"value": int(value['value'])}
-                })
+                        "measurement":  measurement[1],
+                        "time": utc_time,
+                        "tags": {
+                            "Device": DEVICENAME
+                        },
+                        "fields": {
+                            "value": int(value['value'])
+                        }
+                    })
+            logging.info("Recorded " +  measurement[1] + " intraday for date " + date_str)
+        else:
+            logging.error("Recording failed : " +  measurement[1] + " intraday for date " + date_str)
 
+# Max range is 30 days, records BR, SPO2 Intraday, skin temp and HRV - 4 queries
 def get_daily_data_limit_30d(start_date_str, end_date_str):
-    hrv_data_list = request_data_from_fitbit(f'https://api.fitbit.com/1/user/-/hrv/date/{start_date_str}/{end_date_str}.json')['hrv']
-    if hrv_data_list:
+
+    hrv_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/hrv/date/' + start_date_str + '/' + end_date_str + '.json')['hrv']
+    if hrv_data_list != None:
         for data in hrv_data_list:
             log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
             utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
             collected_records.append({
-                "measurement": "HRV",
-                "time": utc_time,
-                "tags": {"Device": DEVICENAME},
-                "fields": {
-                    "dailyRmssd": data["value"]["dailyRmssd"],
-                    "deepRmssd": data["value"]["deepRmssd"]
-                }
-            })
+                    "measurement":  "HRV",
+                    "time": utc_time,
+                    "tags": {
+                        "Device": DEVICENAME
+                    },
+                    "fields": {
+                        "dailyRmssd": data["value"]["dailyRmssd"],
+                        "deepRmssd": data["value"]["deepRmssd"]
+                    }
+                })
+        logging.info("Recorded HRV for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.error("Recording failed HRV for date " + start_date_str + " to " + end_date_str)
 
+    br_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/br/date/' + start_date_str + '/' + end_date_str + '.json')["br"]
+    if br_data_list != None:
+        for data in br_data_list:
+            log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
+            utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+            collected_records.append({
+                    "measurement":  "BreathingRate",
+                    "time": utc_time,
+                    "tags": {
+                        "Device": DEVICENAME
+                    },
+                    "fields": {
+                        "value": data["value"]["breathingRate"]
+                    }
+                })
+        logging.info("Recorded BR for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.error("Recording failed : BR for date " + start_date_str + " to " + end_date_str)
+
+    skin_temp_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/temp/skin/date/' + start_date_str + '/' + end_date_str + '.json')["tempSkin"]
+    if skin_temp_data_list != None:
+        for temp_record in skin_temp_data_list:
+            log_time = datetime.fromisoformat(temp_record["dateTime"] + "T" + "00:00:00")
+            utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+            collected_records.append({
+                    "measurement":  "Skin Temperature Variation",
+                    "time": utc_time,
+                    "tags": {
+                        "Device": DEVICENAME
+                    },
+                    "fields": {
+                        "RelativeValue": temp_record["value"]["nightlyRelative"]
+                    }
+                })
+        logging.info("Recorded Skin Temperature Variation for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.error("Recording failed : Skin Temperature Variation for date " + start_date_str + " to " + end_date_str)
+
+    spo2_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/spo2/date/' + start_date_str + '/' + end_date_str + '/all.json')
+    if spo2_data_list != None:
+        for days in spo2_data_list:
+            data = days["minutes"]
+            for record in data: 
+                log_time = datetime.fromisoformat(record["minute"])
+                utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+                collected_records.append({
+                        "measurement":  "SPO2_Intraday",
+                        "time": utc_time,
+                        "tags": {
+                            "Device": DEVICENAME
+                        },
+                        "fields": {
+                            "value": float(record["value"]),
+                        }
+                    })
+        logging.info("Recorded SPO2 intraday for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.error("Recording failed : SPO2 intraday for date " + start_date_str + " to " + end_date_str)
+
+# Only for sleep data - limit 100 days - 1 query
 def get_daily_data_limit_100d(start_date_str, end_date_str):
-    sleep_data = request_data_from_fitbit(f'https://api.fitbit.com/1.2/user/-/sleep/date/{start_date_str}/{end_date_str}.json')["sleep"]
-    if sleep_data:
+
+    sleep_data = request_data_from_fitbit('https://api.fitbit.com/1.2/user/-/sleep/date/' + start_date_str + '/' + end_date_str + '.json')["sleep"]
+    if sleep_data != None:
         for record in sleep_data:
             log_time = datetime.fromisoformat(record["startTime"])
             utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
-            collected_records.append({
-                "measurement": "Sleep Summary",
-                "time": utc_time,
-                "tags": {"Device": DEVICENAME, "isMainSleep": record["isMainSleep"]},
-                "fields": {
-                    'efficiency': record["efficiency"],
-                    'minutesAfterWakeup': record['minutesAfterWakeup'],
-                    'minutesAsleep': record['minutesAsleep'],
-                    'minutesToFallAsleep': record['minutesToFallAsleep'],
-                    'minutesInBed': record['timeInBed'],
-                    'minutesAwake': record['minutesAwake']
-                }
-            })
+            try:
+                minutesLight= record['levels']['summary']['light']['minutes']
+                minutesREM = record['levels']['summary']['rem']['minutes']
+                minutesDeep = record['levels']['summary']['deep']['minutes']
+            except:
+                minutesLight= record['levels']['summary']['asleep']['minutes']
+                minutesREM = record['levels']['summary']['restless']['minutes']
+                minutesDeep = 0
 
+            collected_records.append({
+                    "measurement":  "Sleep Summary",
+                    "time": utc_time,
+                    "tags": {
+                        "Device": DEVICENAME,
+                        "isMainSleep": record["isMainSleep"],
+                    },
+                    "fields": {
+                        'efficiency': record["efficiency"],
+                        'minutesAfterWakeup': record['minutesAfterWakeup'],
+                        'minutesAsleep': record['minutesAsleep'],
+                        'minutesToFallAsleep': record['minutesToFallAsleep'],
+                        'minutesInBed': record['timeInBed'],
+                        'minutesAwake': record['minutesAwake'],
+                        'minutesLight': minutesLight,
+                        'minutesREM': minutesREM,
+                        'minutesDeep': minutesDeep
+                    }
+                })
+            
+            sleep_level_mapping = {'wake': 3, 'rem': 2, 'light': 1, 'deep': 0, 'asleep': 1, 'restless': 2, 'awake': 3, 'unknown': 4}
+            for sleep_stage in record['levels']['data']:
+                log_time = datetime.fromisoformat(sleep_stage["dateTime"])
+                utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+                collected_records.append({
+                        "measurement":  "Sleep Levels",
+                        "time": utc_time,
+                        "tags": {
+                            "Device": DEVICENAME,
+                            "isMainSleep": record["isMainSleep"],
+                        },
+                        "fields": {
+                            'level': sleep_level_mapping[sleep_stage["level"]],
+                            'duration_seconds': sleep_stage["seconds"]
+                        }
+                    })
+            wake_time = datetime.fromisoformat(record["endTime"])
+            utc_wake_time = LOCAL_TIMEZONE.localize(wake_time).astimezone(pytz.utc).isoformat()
+            collected_records.append({
+                        "measurement":  "Sleep Levels",
+                        "time": utc_wake_time,
+                        "tags": {
+                            "Device": DEVICENAME,
+                            "isMainSleep": record["isMainSleep"],
+                        },
+                        "fields": {
+                            'level': sleep_level_mapping['wake'],
+                            'duration_seconds': None
+                        }
+                    })
+        logging.info("Recorded Sleep data for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.error("Recording failed : Sleep data for date " + start_date_str + " to " + end_date_str)
+
+# Max date range 1 year, records HR zones, Activity minutes and Resting HR - 4 + 3 + 1 + 1 = 9 queries
 def get_daily_data_limit_365d(start_date_str, end_date_str):
     activity_minutes_list = ["minutesSedentary", "minutesLightlyActive", "minutesFairlyActive", "minutesVeryActive"]
     for activity_type in activity_minutes_list:
-        activity_minutes_data_list = request_data_from_fitbit(f'https://api.fitbit.com/1/user/-/activities/tracker/{activity_type}/date/{start_date_str}/{end_date_str}.json')["activities-tracker-"+activity_type]
-        if activity_minutes_data_list:
+        activity_minutes_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/tracker/' + activity_type + '/date/' + start_date_str + '/' + end_date_str + '.json')["activities-tracker-"+activity_type]
+        if activity_minutes_data_list != None:
             for data in activity_minutes_data_list:
                 log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
                 utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
                 collected_records.append({
-                    "measurement": "Activity Minutes",
-                    "time": utc_time,
-                    "tags": {"Device": DEVICENAME},
-                    "fields": {activity_type: int(data["value"])}
-                })
+                        "measurement": "Activity Minutes",
+                        "time": utc_time,
+                        "tags": {
+                            "Device": DEVICENAME
+                        },
+                        "fields": {
+                            activity_type : int(data["value"])
+                        }
+                    })
+            logging.info("Recorded " + activity_type + "for date " + start_date_str + " to " + end_date_str)
+        else:
+            logging.error("Recording failed : " + activity_type + " for date " + start_date_str + " to " + end_date_str)
+        
 
+    activity_others_list = ["distance", "calories", "steps"]
+    for activity_type in activity_others_list:
+        activity_others_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/tracker/' + activity_type + '/date/' + start_date_str + '/' + end_date_str + '.json')["activities-tracker-"+activity_type]
+        if activity_others_data_list != None:
+            for data in activity_others_data_list:
+                log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
+                utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+                activity_name = "Total Steps" if activity_type == "steps" else activity_type
+                collected_records.append({
+                        "measurement": activity_name,
+                        "time": utc_time,
+                        "tags": {
+                            "Device": DEVICENAME
+                        },
+                        "fields": {
+                            "value" : float(data["value"])
+                        }
+                    })
+            logging.info("Recorded " + activity_name + " for date " + start_date_str + " to " + end_date_str)
+        else:
+            logging.error("Recording failed : " + activity_name + " for date " + start_date_str + " to " + end_date_str)
+        
+
+    HR_zones_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/heart/date/' + start_date_str + '/' + end_date_str + '.json')["activities-heart"]
+    if HR_zones_data_list != None:
+        for data in HR_zones_data_list:
+            log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
+            utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+            collected_records.append({
+                    "measurement": "HR zones",
+                    "time": utc_time,
+                    "tags": {
+                        "Device": DEVICENAME
+                    },
+                    "fields": {
+                        "Normal" : data["value"]["heartRateZones"][0]["minutes"],
+                        "Fat Burn" :  data["value"]["heartRateZones"][1]["minutes"],
+                        "Cardio" :  data["value"]["heartRateZones"][2]["minutes"],
+                        "Peak" :  data["value"]["heartRateZones"][3]["minutes"]
+                    }
+                })
+            if "restingHeartRate" in data["value"]:
+                collected_records.append({
+                            "measurement":  "RestingHR",
+                            "time": utc_time,
+                            "tags": {
+                                "Device": DEVICENAME
+                            },
+                            "fields": {
+                                "value": data["value"]["restingHeartRate"]
+                            }
+                        })
+        logging.info("Recorded RHR and HR zones for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.error("Recording failed : RHR and HR zones for date " + start_date_str + " to " + end_date_str)
+
+# records SPO2 single days for the whole given period - 1 query
 def get_daily_data_limit_none(start_date_str, end_date_str):
-    data_list = request_data_from_fitbit(f'https://api.fitbit.com/1/user/-/spo2/date/{start_date_str}/{end_date_str}.json')
-    if data_list:
+    data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/spo2/date/' + start_date_str + '/' + end_date_str + '.json')
+    if data_list != None:
         for data in data_list:
             log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
             utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
             collected_records.append({
-                "measurement": "SPO2",
-                "time": utc_time,
-                "tags": {"Device": DEVICENAME},
-                "fields": {
-                    "avg": data["value"]["avg"],
-                    "max": data["value"]["max"],
-                    "min": data["value"]["min"]
-                }
-            })
+                    "measurement":  "SPO2",
+                    "time": utc_time,
+                    "tags": {
+                        "Device": DEVICENAME
+                    },
+                    "fields": {
+                        "avg": data["value"]["avg"],
+                        "max": data["value"]["max"],
+                        "min": data["value"]["min"]
+                    }
+                })
+        logging.info("Recorded Avg SPO2 for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.error("Recording failed : Avg SPO2 for date " + start_date_str + " to " + end_date_str)
 
+# Fetches latest activities from record ( upto last 100 )
 def fetch_latest_activities(end_date_str):
     recent_activities_data = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/list.json', params={'beforeDate': end_date_str, 'sort':'desc', 'limit':50, 'offset':0})
-    if recent_activities_data:
+    if recent_activities_data != None:
         for activity in recent_activities_data['activities']:
             fields = {}
             if 'activeDuration' in activity:
@@ -261,25 +574,98 @@ def fetch_latest_activities(end_date_str):
             collected_records.append({
                 "measurement": "Activity Records",
                 "time": utc_time,
-                "tags": {"ActivityName": activity['activityName']},
+                "tags": {
+                    "ActivityName": activity['activityName']
+                },
                 "fields": fields
             })
+        logging.info("Fetched 50 recent activities before date " + end_date_str)
+    else:
+        logging.error("Fetching 50 recent activities failed : before date " + end_date_str)
 
-# Scheduler for continuous updates
+
+# %% [markdown]
+# ## Call the functions one time as a startup update OR do switch to bulk update mode
+
+# %%
+if AUTO_DATE_RANGE:
+    date_list = [(start_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((end_date - start_date).days + 1)]
+    if len(date_list) > 3:
+        logging.warn("Auto schedule update is not meant for more than 3 days at a time, please consider lowering the auto_update_date_range variable to aviod rate limit hit!")
+    for date_str in date_list:
+        get_intraday_data_limit_1d(date_str, [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')]) # 2 queries x number of dates ( default 2)
+    get_daily_data_limit_30d(start_date_str, end_date_str) # 3 queries
+    get_daily_data_limit_100d(start_date_str, end_date_str) # 1 query
+    get_daily_data_limit_365d(start_date_str, end_date_str) # 8 queries
+    get_daily_data_limit_none(start_date_str, end_date_str) # 1 query
+    get_battery_level() # 1 query
+    fetch_latest_activities(end_date_str) # 1 query
+    write_points_to_influxdb(collected_records)
+    collected_records = []
+else:
+    # Do Bulk update----------------------------------------------------------------------------------------------------------------------------
+
+    schedule.every(1).hours.do(lambda : Get_New_Access_Token(client_id,client_secret)) # Auto-refresh tokens every 1 hour
+    
+    date_list = [(start_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((end_date - start_date).days + 1)]
+
+    def yield_dates_with_gap(date_list, gap):
+        start_index = -1*gap
+        while start_index < len(date_list)-1:
+            start_index  = start_index + gap
+            end_index = start_index+gap
+            if end_index > len(date_list) - 1:
+                end_index = len(date_list) - 1
+            if start_index > len(date_list) - 1:
+                break
+            yield (date_list[start_index],date_list[end_index])
+
+    def do_bulk_update(funcname, start_date, end_date):
+        global collected_records
+        funcname(start_date, end_date)
+        schedule.run_pending()
+        write_points_to_influxdb(collected_records)
+        collected_records = []
+
+    fetch_latest_activities(date_list[-1])
+    write_points_to_influxdb(collected_records)
+    do_bulk_update(get_daily_data_limit_none, date_list[0], date_list[-1])
+    for date_range in yield_dates_with_gap(date_list, 360):
+        do_bulk_update(get_daily_data_limit_365d, date_range[0], date_range[1])
+    for date_range in yield_dates_with_gap(date_list, 98):
+        do_bulk_update(get_daily_data_limit_100d, date_range[0], date_range[1])
+    for date_range in yield_dates_with_gap(date_list, 28):
+        do_bulk_update(get_daily_data_limit_30d, date_range[0], date_range[1])
+    for single_day in date_list:
+        do_bulk_update(get_intraday_data_limit_1d, single_day, [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')])
+
+    logging.info("Success : Bulk update complete for " + start_date_str + " to " + end_date_str)
+    print("Bulk update complete!")
+
+# %% [markdown]
+# ## Schedule functions at specific intervals (Ongoing continuous update)
+
+# %%
+# Ongoing continuous update of data
 if SCHEDULE_AUTO_UPDATE:
-    schedule.every(1).hours.do(lambda : Get_New_Access_Token(client_id, client_secret))
-    schedule.every(3).minutes.do(lambda : get_intraday_data_limit_1d(end_date_str, [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')]))
-    schedule.every(1).hours.do(lambda : get_intraday_data_limit_1d((datetime.strptime(end_date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"), [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')]))
-    schedule.every(20).minutes.do(get_battery_level)
+    
+    schedule.every(1).hours.do(lambda : Get_New_Access_Token(client_id,client_secret)) # Auto-refresh tokens every 1 hour
+    schedule.every(3).minutes.do( lambda : get_intraday_data_limit_1d(end_date_str, [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')] )) # Auto-refresh detailed HR and steps
+    schedule.every(1).hours.do( lambda : get_intraday_data_limit_1d((datetime.strptime(end_date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"), [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')] )) # Refilling any missing data on previous day end of night due to fitbit sync delay ( see issue #10 )
+    schedule.every(20).minutes.do(get_battery_level) # Auto-refresh battery level
     schedule.every(3).hours.do(lambda : get_daily_data_limit_30d(start_date_str, end_date_str))
     schedule.every(4).hours.do(lambda : get_daily_data_limit_100d(start_date_str, end_date_str))
-    schedule.every(6).hours.do(lambda : get_daily_data_limit_365d(start_date_str, end_date_str))
+    schedule.every(6).hours.do( lambda : get_daily_data_limit_365d(start_date_str, end_date_str))
     schedule.every(6).hours.do(lambda : get_daily_data_limit_none(start_date_str, end_date_str))
-    schedule.every(1).hours.do(lambda : fetch_latest_activities(end_date_str))
+    schedule.every(1).hours.do( lambda : fetch_latest_activities(end_date_str))
 
     while True:
         schedule.run_pending()
-        if collected_records:
-            write_points_to_victoria_metrics(collected_records)
+        if len(collected_records) != 0:
+            write_points_to_influxdb(collected_records)
             collected_records = []
         time.sleep(30)
+        update_working_dates()
+        
+
+
