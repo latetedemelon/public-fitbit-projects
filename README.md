@@ -1,4 +1,4 @@
-> **Part of the Personal Health Data Platform** (hub: `Healthkit-influxdb-grafana`).
+> **Part of [health-influx-grafana](https://github.com/latetedemelon/health-influx-grafana)** — a self-hosted, multi-source personal health dashboard.
 > This fetcher now writes to **VictoriaMetrics** via the InfluxDB line protocol and tags every
 > series `provider=fitbit`, so your Fitbit data can share one store and one Grafana with Apple,
 > ResMed, Google and Renpho. See the hub's `docs/ARCHITECTURE.md` for the data conventions.
